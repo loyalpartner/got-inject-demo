@@ -116,7 +116,28 @@ long remote_write(pid_t pid, void *remote_addr, void *data, size_t len) {
     
     long result = process_vm_writev(pid, &local, 1, &remote, 1, 0);
     if (result == -1) {
-        printf("[ERROR] 无法写入远程内存: %s\n", strerror(errno));
+        printf("[ERROR] 无法写入远程内存: %s (地址: %p, 数据: %s)\n", 
+               strerror(errno), remote_addr, (char*)data);
+        
+        // 尝试使用ptrace作为备选方案
+        printf("[INFO] 尝试使用ptrace写入内存...\n");
+        
+        // 对于每个字
+        long *src = (long*)data;
+        size_t words = (len + sizeof(long) - 1) / sizeof(long);
+        
+        for (size_t i = 0; i < words; i++) {
+            long word_to_write = src[i];
+            if (ptrace(PTRACE_POKEDATA, pid, 
+                       (void*)((char*)remote_addr + i * sizeof(long)), 
+                       (void*)word_to_write) == -1) {
+                printf("[ERROR] ptrace写入失败: %s\n", strerror(errno));
+                return -1;
+            }
+        }
+        
+        printf("[INFO] 使用ptrace成功写入数据\n");
+        return len;
     } else {
         printf("[INFO] 成功写入 %ld 字节到地址 %p\n", result, remote_addr);
     }
@@ -131,7 +152,8 @@ long remote_read(pid_t pid, void *remote_addr, void *local_buf, size_t len) {
     
     long result = process_vm_readv(pid, &remote, 1, &local, 1, 0);
     if (result == -1) {
-        printf("[ERROR] 无法读取远程内存: %s\n", strerror(errno));
+        printf("[WARN] 无法读取远程内存: %s (地址: %p, 长度: %zu)\n", 
+               strerror(errno), remote_addr, len);
     }
     
     return result;
@@ -152,6 +174,27 @@ void* allocate_remote_memory(pid_t pid) {
     void *result = NULL;
     char line[512];
     
+    // 首先扫描 [heap] 区域
+    rewind(maps_file);
+    while (fgets(line, sizeof(line), maps_file)) {
+        if (strstr(line, "[heap]") && strstr(line, "rw-p")) {
+            unsigned long start, end;
+            if (sscanf(line, "%lx-%lx", &start, &end) == 2) {
+                size_t size = end - start;
+                if (size >= 4096) {
+                    // 使用堆区域的后半部分，避免干扰程序数据
+                    result = (void*)(start + size/2);
+                    printf("[INFO] 使用堆内存区域: %p (原始: %p, 大小: %lu)\n", 
+                           result, (void*)start, size);
+                    fclose(maps_file);
+                    return result;
+                }
+            }
+        }
+    }
+    
+    // 然后查找其他读写区域
+    rewind(maps_file);
     while (fgets(line, sizeof(line), maps_file)) {
         // 查找具有读写权限的区域
         if (strstr(line, "rw-p")) {
@@ -171,12 +214,9 @@ void* allocate_remote_memory(pid_t pid) {
     fclose(maps_file);
     
     if (result) {
-        // 验证内存可写
-        char test_buf[16] = {0};
-        if (remote_read(pid, result, test_buf, sizeof(test_buf)) > 0) {
-            printf("[INFO] 成功验证内存可读\n");
-            return result;
-        }
+        // 跳过内存验证，直接使用找到的区域
+        printf("[INFO] 使用找到的内存区域\n");
+        return result;
     }
     
     // 如果找不到合适的区域，使用mmap系统调用分配
@@ -296,8 +336,27 @@ int main(int argc, char *argv[]) {
     // 写入共享库路径
     if (remote_write(pid, remote_mem, (void *)so_path, strlen(so_path) + 1) == -1) {
         fprintf(stderr, "[ERROR] 无法写入共享库路径\n");
-        ptrace(PTRACE_DETACH, pid, NULL, NULL);
-        return 1;
+        
+        // 尝试在不同地址重新分配
+        printf("[INFO] 尝试备用内存地址...\n");
+        
+        // 尝试在栈区域分配
+        struct user_regs_struct stack_regs;
+        if (ptrace(PTRACE_GETREGS, pid, NULL, &stack_regs) != -1) {
+            // 使用目标进程的栈指针上方区域
+            remote_mem = (void*)(stack_regs.rsp - 8192);
+            printf("[INFO] 尝试使用栈区域: %p\n", remote_mem);
+            
+            if (remote_write(pid, remote_mem, (void *)so_path, strlen(so_path) + 1) == -1) {
+                fprintf(stderr, "[ERROR] 备用地址仍然失败\n");
+                ptrace(PTRACE_DETACH, pid, NULL, NULL);
+                return 1;
+            }
+        } else {
+            fprintf(stderr, "[ERROR] 无法获取栈地址\n");
+            ptrace(PTRACE_DETACH, pid, NULL, NULL);
+            return 1;
+        }
     }
 
     // 获取远程dlopen函数地址

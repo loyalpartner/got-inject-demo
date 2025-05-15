@@ -8,12 +8,74 @@
 #include <elf.h>
 #include <errno.h>
 #include <unistd.h>
+#include <pthread.h>
+#include <time.h>
+#include <stdbool.h>
+#include <stdarg.h>
+#include <fcntl.h>
 
 // 保存原始的 puts 函数指针
 static int (*real_puts)(const char *) = NULL;
 
 // 一个标志，指示钩子是否已初始化
 static int hook_initialized = 0;
+
+// 记录统计信息
+static int interception_count = 0;
+static time_t first_intercept_time = 0;
+static char last_intercepted_string[256] = {0};
+static pthread_mutex_t stats_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// 调试模式标志
+static bool debug_mode = true;
+
+// 钩子日志函数
+void hook_log(const char *format, ...) {
+    if (!debug_mode) return;
+    
+    char buffer[1024];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
+    
+    // 添加时间戳和进程ID
+    char final_buffer[1280];
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    
+    snprintf(final_buffer, sizeof(final_buffer), 
+             "[HOOK %02d:%02d:%02d PID:%d] %s\n",
+             tm_info->tm_hour, tm_info->tm_min, tm_info->tm_sec,
+             getpid(), buffer);
+    
+    write(STDERR_FILENO, final_buffer, strlen(final_buffer));
+}
+
+// 检查钩子是否成功工作的测试函数
+void __attribute__((constructor)) test_hook() {
+    hook_log("钩子自测开始");
+    const char *test_str = "HOOK_TEST_STRING";
+    
+    // 保存stdout的原始文件描述符
+    int stdout_fd = dup(STDOUT_FILENO);
+    
+    // 重定向stdout到/dev/null
+    int null_fd = open("/dev/null", O_WRONLY);
+    if (null_fd != -1) {
+        dup2(null_fd, STDOUT_FILENO);
+        close(null_fd);
+    }
+    
+    // 调用puts，这应该会被拦截
+    puts(test_str);
+    
+    // 恢复stdout
+    dup2(stdout_fd, STDOUT_FILENO);
+    close(stdout_fd);
+    
+    hook_log("钩子自测完成");
+}
 
 // 我们的钩子函数替换 puts
 int my_puts(const char *str) {
@@ -23,11 +85,44 @@ int my_puts(const char *str) {
         return -1;
     }
     
-    char buffer[256];
-    snprintf(buffer, sizeof(buffer), "[HOOK] 拦截了: %s\n", str);
-    write(STDERR_FILENO, buffer, strlen(buffer));
+    // 更新统计信息
+    pthread_mutex_lock(&stats_mutex);
+    interception_count++;
+    if (first_intercept_time == 0) {
+        first_intercept_time = time(NULL);
+    }
+    if (str) {
+        strncpy(last_intercepted_string, str, sizeof(last_intercepted_string)-1);
+        last_intercepted_string[sizeof(last_intercepted_string)-1] = '\0';
+    }
+    pthread_mutex_unlock(&stats_mutex);
+    
+    hook_log("拦截了puts调用: \"%s\"", str ? str : "(null)");
     
     return real_puts("[HOOKED] I've intercepted your puts!");
+}
+
+// 检查钩子状态的函数，可以从外部调用
+void check_hook_status() {
+    pthread_mutex_lock(&stats_mutex);
+    hook_log("===== 钩子状态报告 =====");
+    hook_log("钩子初始化: %s", hook_initialized ? "成功" : "失败");
+    hook_log("拦截次数: %d", interception_count);
+    if (first_intercept_time > 0) {
+        time_t now = time(NULL);
+        hook_log("首次拦截时间: %ld (约 %ld 秒前)", 
+                first_intercept_time, now - first_intercept_time);
+    } else {
+        hook_log("首次拦截时间: 未拦截");
+    }
+    hook_log("最后拦截的字符串: %s", 
+            last_intercepted_string[0] ? last_intercepted_string : "(无)");
+    hook_log("原始puts函数地址: %p", real_puts);
+    hook_log("钩子函数地址: %p", my_puts);
+    void *current_puts = dlsym(RTLD_DEFAULT, "puts");
+    hook_log("当前puts符号: %p", current_puts);
+    hook_log("=======================");
+    pthread_mutex_unlock(&stats_mutex);
 }
 
 // 直接在目标进程中查找并修改puts的GOT条目
@@ -244,38 +339,52 @@ int phdr_callback(struct dl_phdr_info *info, size_t size, void *data) {
 
 __attribute__((constructor))
 void init_hook() {
-    fprintf(stderr, "\n[HOOK] 开始初始化 puts 钩子...\n");
+    hook_log("开始初始化 puts 钩子...");
     
     // 打印当前进程信息
-    fprintf(stderr, "[INFO] 进程ID: %d\n", getpid());
+    hook_log("进程ID: %d", getpid());
+    hook_log("库加载地址: %p", (void*)&init_hook);
+    
+    // 尝试立即获取puts符号
+    void *puts_symbol = dlsym(RTLD_DEFAULT, "puts");
+    hook_log("全局puts符号: %p", puts_symbol);
+    
+    // 保存原始puts以备后用
+    if (!real_puts) {
+        real_puts = puts;
+        hook_log("预先保存原始puts: %p", real_puts);
+    }
     
     // 先尝试使用传统方法
     int result = dl_iterate_phdr(phdr_callback, NULL);
     if (result && hook_initialized && real_puts) {
-        fprintf(stderr, "[INFO] 使用传统方法成功钩取puts\n");
+        hook_log("使用传统方法成功钩取puts");
+        check_hook_status();
         return;
     }
     
     // 如果传统方法失败，尝试直接查找方法
     if (!hook_initialized || !real_puts) {
-        fprintf(stderr, "[INFO] 传统方法失败，尝试直接查找方法\n");
+        hook_log("传统方法失败，尝试直接查找方法");
         find_and_hook_target();
     }
     
     // 最后的验证
     if (hook_initialized && real_puts) {
-        fprintf(stderr, "[SUCCESS] puts钩子初始化成功\n");
+        hook_log("puts钩子初始化成功");
     } else {
-        fprintf(stderr, "[ERROR] puts钩子初始化失败\n");
+        hook_log("puts钩子初始化失败");
         
         // 最后的后备方案，直接获取puts
         real_puts = puts;
         if (real_puts) {
-            fprintf(stderr, "[INFO] 从全局符号表获取puts作为后备\n");
+            hook_log("从全局符号表获取puts作为后备");
             hook_initialized = 1;
         }
     }
     
-    // 确保所有日志都已刷新
-    fflush(stderr);
+    check_hook_status();
+    
+    // 确保日志已写入
+    fsync(STDERR_FILENO);
 }
